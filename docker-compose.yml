@@ -1,0 +1,22 @@
+services:
+  backend:
+    build: ./backend
+    environment:
+      APP_MODE: ${APP_MODE:-DEMO}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+      REALTIME_ENABLED: ${REALTIME_ENABLED:-true}
+      SEED_FIXTURES: ${SEED_FIXTURES:-false}
+      REALTIME_POLL_SECONDS: ${REALTIME_POLL_SECONDS:-5}
+      ZTP_BASE_URL: ${ZTP_BASE_URL:-https://gtfs.ztp.krakow.pl}
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000/api/v1}
+      SITE_URL: ${SITE_URL:-http://localhost:5173}
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
