@@ -5,9 +5,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
+    demo_overload,
     demo_vehicles,
     dispatch,
     health,
+    ingest,
     live,
     recommendations,
     routes,
@@ -31,6 +33,15 @@ async def simulation_loop(app: FastAPI) -> None:
                     "vehicle.updated",
                     vehicle.model_dump(mode="json", by_alias=True),
                 )
+        for vehicle, recommendation in store.refresh_demo_overloads():
+            await live_updates.publish(
+                "vehicle.updated", vehicle.model_dump(mode="json", by_alias=True)
+            )
+            if recommendation:
+                await live_updates.publish(
+                    "recommendation.created",
+                    recommendation.model_dump(mode="json", by_alias=True),
+                )
 
 
 async def realtime_loop(app: FastAPI) -> None:
@@ -47,14 +58,22 @@ async def realtime_loop(app: FastAPI) -> None:
             try:
                 snapshot = await provider.get_snapshot()
                 store: StateStore = app.state.store
-                store.apply_realtime_snapshot(snapshot)
+                # Publish what the store holds, not the raw feed: the feed carries no
+                # occupancy, and broadcasting it would blank every counter reading on
+                # the dashboard five seconds after it arrived.
+                merged = store.apply_realtime_snapshot(snapshot)
+                for recommendation in store.evaluate_counted_vehicles():
+                    await live_updates.publish(
+                        "recommendation.created",
+                        recommendation.model_dump(mode="json", by_alias=True),
+                    )
                 await live_updates.publish(
                     "vehicles.snapshot",
                     {
                         "generatedAt": store.last_realtime_update.isoformat(),
                         "vehicles": [
                             vehicle.model_dump(mode="json", by_alias=True)
-                            for vehicle in snapshot.vehicles
+                            for vehicle in merged
                         ],
                     },
                 )
@@ -105,3 +124,5 @@ app.include_router(dispatch.router, prefix=api_prefix)
 app.include_router(scenarios.router, prefix=api_prefix)
 app.include_router(demo_vehicles.router, prefix=api_prefix)
 app.include_router(live.router, prefix=api_prefix)
+app.include_router(ingest.router, prefix=api_prefix)
+app.include_router(demo_overload.router, prefix=api_prefix)

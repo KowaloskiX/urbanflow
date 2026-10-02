@@ -1,3 +1,4 @@
+from bisect import insort
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -12,12 +13,23 @@ from app.domain.route import RouteShape, RouteSummary
 from app.domain.scenario import Scenario, ScenarioActivationResponse
 from app.domain.vehicle import (
     Freshness,
+    MobilityAids,
     OccupancyStatus,
     VehicleHistoryPoint,
     VehicleMode,
     VehicleState,
 )
 from app.services.decision_engine import DecisionEngine
+from app.services.devices import DeviceRegistry
+from app.services.occupancy_tracker import DoorCounterOccupancy
+
+# What the decision engine is told when it runs on live counter data. Both are
+# placeholders: the real headway comes from the GTFS timetable for the route, and
+# reserve availability from the depot. They match the values the demo scenarios already
+# use, so live and scripted runs behave alike. This is the seam where better dispatch
+# heuristics plug in.
+LIVE_ASSUMED_HEADWAY_SECONDS = 660
+LIVE_ASSUMED_RESERVE_AVAILABLE = True
 
 ROUTE_16_COORDINATES = [
     [19.9350, 50.0670],
@@ -36,6 +48,18 @@ ROUTE_4_COORDINATES = [
 
 DEMO_MAX_SPEED = 5
 
+# A staged overload for presentations: a live tram held full through the same
+# counter path a camera uses. Re-anchored well inside the stale window, and
+# released after a while so a forgotten demo does not stay red all day.
+DEMO_OVERLOAD_LOAD = 0.92
+DEMO_OVERLOAD_CAPACITY = 202
+DEMO_OVERLOAD_REFRESH = timedelta(seconds=30)
+DEMO_OVERLOAD_DURATION = timedelta(minutes=10)
+# What a cabin camera would add on a full tram, so the demo tells the whole story.
+DEMO_OVERLOAD_AIDS = MobilityAids(wheelchairs=1, strollers=1)
+# The pitch shows the city centre; a full tram at a terminus is easy to miss.
+KRAKOW_CENTRE = (50.0614, 19.9372)
+
 
 @dataclass
 class DemoRun:
@@ -45,6 +69,15 @@ class DemoRun:
     capacity: int
     simulation_speed: int
     created_at: datetime
+
+
+@dataclass
+class DemoOverload:
+    vehicle_id: str
+    occupancy: int
+    capacity: int
+    started_at: datetime
+    refreshed_at: datetime
 
 
 def occupancy_status(load_factor: float | None) -> OccupancyStatus:
@@ -72,9 +105,15 @@ class StateStore:
         self.recommendations: dict[str, Recommendation] = {}
         self.dispatches: dict[str, Dispatch] = {}
         self.demo_runs: dict[str, DemoRun] = {}
+        self.demo_overloads: dict[str, DemoOverload] = {}
         self.routes: dict[str, RouteSummary] = {}
         self.shapes: dict[tuple[str, int], list[list[float]]] = {}
         self.active_scenario_id: str | None = None
+        self.occupancy = DoorCounterOccupancy(
+            stale_after_seconds=settings.occupancy_stale_seconds,
+            confidence=settings.occupancy_confidence,
+        )
+        self.devices = DeviceRegistry.from_file(settings.ingest_devices_file)
         self.last_realtime_update = utc_now()
         self.source_health = {
             "gtfsStatic": "ok" if settings.seed_fixtures else "stale",
@@ -186,7 +225,7 @@ class StateStore:
             self.vehicles.clear()
             self._seed_demo_data()
 
-    def apply_realtime_snapshot(self, snapshot) -> None:
+    def apply_realtime_snapshot(self, snapshot) -> list[VehicleState]:
         now = utc_now()
         simulations = {
             vehicle_id: vehicle
@@ -205,10 +244,12 @@ class StateStore:
             and (now - vehicle.position_measured_at).total_seconds()
             <= self.settings.stale_max_age_seconds
         }
+        # GTFS-RT carries no occupancy, so every snapshot arrives with it empty.
+        # Overlaying the counter's measurement here is what stops each 5-second poll
+        # from wiping it.
+        incoming = [self._with_occupancy(vehicle) for vehicle in snapshot.vehicles]
         self.vehicles = recently_missing_vehicles
-        self.vehicles.update(
-            {vehicle.vehicle_id: vehicle for vehicle in snapshot.vehicles}
-        )
+        self.vehicles.update({vehicle.vehicle_id: vehicle for vehicle in incoming})
         self.vehicles.update(simulations)
         self.routes.update(snapshot.routes)
         self.shapes.update(snapshot.shapes)
@@ -218,24 +259,148 @@ class StateStore:
         self.source_health["gtfsRealtime"] = (
             "ok" if online_count == 2 else "stale" if online_count == 1 else "offline"
         )
-        for vehicle in snapshot.vehicles:
+        if self.occupancy.has_fresh_data():
+            self.source_health["occupancy"] = "ok"
+        for vehicle in incoming:
             points = self.history[vehicle.vehicle_id]
             if not points or points[-1].measured_at < vehicle.position_measured_at:
                 points.append(
                     self._history_point(vehicle, vehicle.position_measured_at)
                 )
                 self.history[vehicle.vehicle_id] = points[-360:]
+        return incoming
+
+    def _with_occupancy(self, vehicle: VehicleState) -> VehicleState:
+        """The vehicle with the counter's measurement overlaid, when one is fresh."""
+        measurement = self.occupancy.current(vehicle.vehicle_id)
+        if measurement is None:
+            return vehicle
+        return vehicle.model_copy(
+            update={
+                "passenger_count": measurement.passenger_count,
+                "capacity": measurement.capacity,
+                "load_factor": measurement.load_factor,
+                "occupancy_confidence": measurement.confidence,
+                "occupancy_status": occupancy_status(measurement.load_factor),
+                "occupancy_measured_at": measurement.measured_at,
+                "mobility_aids": self.occupancy.mobility_aids(vehicle.vehicle_id),
+                "updated_at": utc_now(),
+            }
+        )
+
+    def apply_counter_update(
+        self, vehicle_id: str
+    ) -> tuple[VehicleState | None, Recommendation | None]:
+        """Folds a new counter measurement into the vehicle and asks the engine.
+
+        Returns `(None, None)` when the vehicle is not on the map yet — the count is
+        kept and overlaid as soon as GTFS-RT reports the vehicle.
+        """
+        vehicle = self.vehicles.get(vehicle_id)
+        if vehicle is None:
+            return None, None
+        vehicle = self._with_occupancy(vehicle)
+        self.vehicles[vehicle_id] = vehicle
+        self.source_health["occupancy"] = "ok"
+        if vehicle.occupancy_measured_at is not None:
+            # Kept in time order: a batch buffered through a tunnel can land after a
+            # newer GTFS point, and the engine walks history backwards from the newest.
+            insort(
+                self.history[vehicle_id],
+                self._history_point(vehicle, vehicle.occupancy_measured_at),
+                key=lambda point: point.measured_at,
+            )
+            self.history[vehicle_id] = self.history[vehicle_id][-360:]
+        return vehicle, self.evaluate_live(vehicle)
+
+    def evaluate_counted_vehicles(self) -> list[Recommendation]:
+        """Re-evaluates every vehicle that has a fresh counter reading.
+
+        Called on each GTFS poll. Evaluating only when a counter sends something misses
+        the case the engine exists for: a tram packed so full that nobody gets on or off
+        sends no events at all, so it would never be looked at again.
+        """
+        created = []
+        for vehicle in list(self.vehicles.values()):
+            if vehicle.is_simulation:
+                continue
+            if self.occupancy.current(vehicle.vehicle_id) is None:
+                continue
+            recommendation = self.evaluate_live(vehicle)
+            if recommendation:
+                created.append(recommendation)
+        return created
+
+    def evaluate_live(self, vehicle: VehicleState) -> Recommendation | None:
+        """Runs the decision engine on live data — until now it only ran for scenarios.
+
+        At most one open recommendation per route and direction: a tram that stays full
+        for ten minutes is one problem, not one recommendation per counter batch. A
+        reserve already on its way answers the problem too, so the line stays quiet
+        until that run ends.
+        """
+        if self._line_handled(vehicle.route_id, vehicle.direction_id):
+            return None
+        recommendation = self.engine.evaluate(
+            vehicle,
+            self.history[vehicle.vehicle_id],
+            headway_seconds=LIVE_ASSUMED_HEADWAY_SECONDS,
+            reserve_available=LIVE_ASSUMED_RESERVE_AVAILABLE,
+        )
+        if recommendation:
+            self.recommendations[recommendation.id] = recommendation
+        return recommendation
+
+    def _line_handled(self, route_id: str, direction_id: int) -> bool:
+        open_recommendation = any(
+            rec.status == RecommendationStatus.OPEN
+            and rec.route_id == route_id
+            and rec.direction_id == direction_id
+            for rec in self.recommendations.values()
+        )
+        reserve_running = any(
+            dispatch.route_id == route_id
+            and dispatch.direction_id == direction_id
+            and dispatch.status
+            not in {DispatchStatus.CANCELLED, DispatchStatus.COMPLETED}
+            for dispatch in self.dispatches.values()
+        )
+        return open_recommendation or reserve_running
 
     def mark_realtime_failure(self) -> None:
         self.source_health["gtfsRealtime"] = "offline"
 
     def list_vehicles(self) -> list[VehicleState]:
         self.refresh_simulations()
+        self._expire_stale_occupancy()
         return list(self.vehicles.values())
 
     def get_vehicle(self, vehicle_id: str) -> VehicleState | None:
         self.refresh_simulations()
+        self._expire_stale_occupancy()
         return self.vehicles.get(vehicle_id)
+
+    def _expire_stale_occupancy(self) -> None:
+        """Clears a counter reading once it goes stale.
+
+        With GTFS-RT on, every poll replaces the vehicle and a stale count is simply
+        not overlaid again. Without a feed — demo mode — nothing replaces it, so a count
+        from an hour ago would sit on the map looking current. Only counter readings
+        are cleared: a scripted scenario's occupancy is left alone.
+        """
+        for vehicle_id, vehicle in self.vehicles.items():
+            expired = self.occupancy.expired_at(vehicle_id)
+            if expired is None or vehicle.occupancy_measured_at != expired:
+                continue
+            self.vehicles[vehicle_id] = vehicle.model_copy(
+                update={
+                    "passenger_count": None,
+                    "mobility_aids": None,
+                    "load_factor": None,
+                    "occupancy_confidence": None,
+                    "occupancy_status": OccupancyStatus.UNKNOWN,
+                }
+            )
 
     def vehicle_history(
         self, vehicle_id: str, minutes: int
@@ -481,6 +646,88 @@ class StateStore:
         )
         self.demo_runs[vehicle_id] = run
         return self._upsert_demo_vehicle(run, 0)
+
+    def start_demo_overload(self, vehicle_id: str | None) -> VehicleState:
+        """Holds a live tram full, as if its door counter reported it.
+
+        Without an id it picks the live tram closest to the city centre. Raises
+        `KeyError` for an unknown or unsuitable vehicle and `LookupError` when no live
+        tram is on the map.
+        """
+        vehicle = (
+            self._overload_candidate(vehicle_id)
+            if vehicle_id
+            else self._central_live_tram()
+        )
+        capacity = vehicle.capacity or DEMO_OVERLOAD_CAPACITY
+        now = utc_now()
+        overload = DemoOverload(
+            vehicle_id=vehicle.vehicle_id,
+            occupancy=round(capacity * DEMO_OVERLOAD_LOAD),
+            capacity=capacity,
+            started_at=now,
+            refreshed_at=now,
+        )
+        self.demo_overloads[vehicle.vehicle_id] = overload
+        updated, _ = self._anchor_overload(overload, now)
+        return updated or vehicle
+
+    def stop_demo_overload(self, vehicle_id: str) -> bool:
+        return self.demo_overloads.pop(vehicle_id, None) is not None
+
+    def refresh_demo_overloads(
+        self,
+    ) -> list[tuple[VehicleState, Recommendation | None]]:
+        """Re-anchors held trams before their count goes stale; releases old ones."""
+        now = utc_now()
+        refreshed = []
+        for overload in list(self.demo_overloads.values()):
+            if now - overload.started_at > DEMO_OVERLOAD_DURATION:
+                self.demo_overloads.pop(overload.vehicle_id)
+            elif now - overload.refreshed_at >= DEMO_OVERLOAD_REFRESH:
+                overload.refreshed_at = now
+                vehicle, recommendation = self._anchor_overload(overload, now)
+                if vehicle:
+                    refreshed.append((vehicle, recommendation))
+        return refreshed
+
+    def _anchor_overload(
+        self, overload: DemoOverload, now: datetime
+    ) -> tuple[VehicleState | None, Recommendation | None]:
+        self.occupancy.record_anchor(
+            overload.vehicle_id,
+            overload.capacity,
+            overload.occupancy,
+            now,
+            DEMO_OVERLOAD_AIDS,
+        )
+        return self.apply_counter_update(overload.vehicle_id)
+
+    def _overload_candidate(self, vehicle_id: str) -> VehicleState:
+        vehicle = self.vehicles.get(vehicle_id)
+        if vehicle is None or vehicle.is_simulation:
+            raise KeyError("Vehicle not found")
+        if vehicle.vehicle_mode != VehicleMode.TRAM:
+            raise KeyError("Only trams can be overloaded")
+        return vehicle
+
+    def _central_live_tram(self) -> VehicleState:
+        trams = [
+            vehicle
+            for vehicle in self.vehicles.values()
+            if not vehicle.is_simulation
+            and vehicle.vehicle_mode == VehicleMode.TRAM
+            and vehicle.vehicle_id not in self.demo_overloads
+        ]
+        if not trams:
+            raise LookupError("No live tram on the map")
+        latitude, longitude = KRAKOW_CENTRE
+        return min(
+            trams,
+            key=lambda tram: (
+                (tram.latitude - latitude) ** 2 + (tram.longitude - longitude) ** 2
+            ),
+        )
 
     def delete_demo_vehicle(self, vehicle_id: str) -> bool:
         if vehicle_id not in self.demo_runs:

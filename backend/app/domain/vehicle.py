@@ -27,6 +27,14 @@ class VehicleMode(StrEnum):
     BUS = "BUS"
 
 
+class MobilityAids(ApiModel):
+    """What a cabin camera sees besides people: items that take the floor of several."""
+
+    wheelchairs: int = 0
+    strollers: int = 0
+    bicycles: int = 0
+
+
 class VehicleState(ApiModel):
     vehicle_id: str
     trip_id: str
@@ -49,6 +57,7 @@ class VehicleState(ApiModel):
     occupancy_status: OccupancyStatus = OccupancyStatus.UNKNOWN
     position_measured_at: datetime
     occupancy_measured_at: datetime | None = None
+    mobility_aids: MobilityAids | None = None
     updated_at: datetime
     freshness: Freshness
     source: str

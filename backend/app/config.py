@@ -13,6 +13,14 @@ class Settings:
     seed_fixtures: bool = True
     realtime_poll_seconds: float = 5
     ztp_base_url: str = "https://gtfs.ztp.krakow.pl"
+    # Door counters: which key writes for which vehicle (see app/services/devices.py).
+    ingest_devices_file: str = "devices.local.json"
+    # A count older than this is not shown as current — the dashboard shows UNKNOWN and
+    # the decision engine ignores it, rather than acting on a frozen reading.
+    occupancy_stale_seconds: int = 180
+    # Declared, not measured: door counters report no confidence. Replace once counts
+    # have been checked against a manual tally.
+    occupancy_confidence: float = 0.9
 
 
 def get_settings() -> Settings:
@@ -25,4 +33,7 @@ def get_settings() -> Settings:
         in {"1", "true", "yes"},
         realtime_poll_seconds=float(os.getenv("REALTIME_POLL_SECONDS", "5")),
         ztp_base_url=os.getenv("ZTP_BASE_URL", "https://gtfs.ztp.krakow.pl"),
+        ingest_devices_file=os.getenv("INGEST_DEVICES_FILE", "devices.local.json"),
+        occupancy_stale_seconds=int(os.getenv("OCCUPANCY_STALE_SECONDS", "180")),
+        occupancy_confidence=float(os.getenv("OCCUPANCY_CONFIDENCE", "0.9")),
     )
