@@ -1,0 +1,90 @@
+[project]
+name = "counter"
+version = "0.0.0"
+description = "Passenger counter: detects people at a tram doorway and reports crossings"
+requires-python = ">=3.12"
+# Deliberately light. The counting logic — tracking and line crossing — is pure Python and
+# needs nothing, so it installs and tests in seconds, on a laptop and in CI alike.
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+]
+
+[project.optional-dependencies]
+# The model and the camera. Several gigabytes of wheels, so they are opt-in: CI runs the
+# counting logic without them, and only a device that actually looks at a doorway installs
+# this.
+#
+# RT-DETR rather than YOLO, and the licence is the reason. Ultralytics YOLO is **AGPL-3.0**:
+# shipping it in a product means publishing the product's source or buying a commercial
+# licence, and the obligation reaches a server you merely operate. RT-DETR is Apache-2.0 and
+# comparable at this task. Another detector is a new file under `adapters/` implementing
+# `PersonDetector` — the port exists so that stays a one-file change.
+ml = [
+    "torch>=2.4",
+    # Not optional despite the name: transformers' image processors refuse to load without
+    # it, and the failure is an ImportError at first inference rather than at install.
+    "torchvision>=0.19",
+    "transformers>=4.44",
+    "pillow>=10.0",
+    "opencv-python-headless>=4.10",
+]
+
+[project.scripts]
+count-doorway = "counter.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/counter"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+files = ["src", "tests"]
+
+# The machine-learning stack is an optional extra, so in a default install these modules are
+# genuinely absent and mypy cannot resolve them. This declares that fact rather than hiding a
+# type error: our own code is still checked strictly, and `adapters/rtdetr.py` is the only file
+# that touches them.
+[[tool.mypy.overrides]]
+module = ["torch.*", "transformers.*", "cv2.*"]
+ignore_missing_imports = true
+
+# `transformers` ships incomplete annotations, so `from_pretrained` reads as untyped and strict
+# mode rejects calling it. Relaxed for the one file that talks to the library — and only that
+# check, so the rest of strict mode still applies here. Everything above the detector port stays
+# fully strict, which is where the counting logic lives.
+#
+# It matters that this is scoped: without the extra installed (CI, and a default `uv sync`) the
+# override above already covers the imports, so this line changes nothing there. With the extra
+# installed it keeps the local gate identical to the one CI runs.
+[[tool.mypy.overrides]]
+module = "counter.adapters.rtdetr"
+disallow_untyped_calls = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src"]
+testpaths = ["tests"]
