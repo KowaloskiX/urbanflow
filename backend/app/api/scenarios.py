@@ -22,6 +22,14 @@ async def activate_scenario(
         raise HTTPException(
             status_code=403, detail="Scenarios are available only in DEMO mode"
         )
+    if not store.settings.seed_fixtures:
+        # The scenarios script vehicle 2184, which only exists as a fixture. Against the
+        # live feed it is absent and activation used to fail with a KeyError (HTTP 500).
+        raise HTTPException(
+            status_code=409,
+            detail="Scenarios need SEED_FIXTURES=true; with the live feed use "
+            "scripts/demo_overload.py instead",
+        )
     result = store.activate_scenario(scenario_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Scenario not found")
