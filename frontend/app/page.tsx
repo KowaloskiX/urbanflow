@@ -1,5 +1,5 @@
-import { UrbanFlowDashboard } from '@/components/urban-flow-dashboard';
+import { PitchPage } from '@/components/pitch/pitch-page';
 
 export default function Home() {
-  return <UrbanFlowDashboard />;
+  return <PitchPage />;
 }
