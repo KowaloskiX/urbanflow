@@ -1,6 +1,6 @@
 'use client';
 
-import Image from 'next/image';
+import Link from 'next/link';
 import {
   useCallback,
   useEffect,
@@ -11,16 +11,13 @@ import {
 } from 'react';
 import type {
   GeoJSONSource,
+  LayerSpecification,
   Map as MapLibreMap,
   MapLayerMouseEvent,
 } from 'maplibre-gl';
 import {
   Activity,
-  AlertTriangle,
-  ArrowDownRight,
   BusFront,
-  ChevronRight,
-  Clock3,
   LocateFixed,
   MapPin,
   PanelRightClose,
@@ -28,7 +25,10 @@ import {
   Plus,
   Radio,
   RefreshCw,
-  Route,
+  Send,
+  Accessibility,
+  ChevronLeft,
+  ChevronRight,
   TramFront,
   Users,
   Wifi,
@@ -36,8 +36,14 @@ import {
   X,
 } from 'lucide-react';
 
+import { AnimatePresence, MotionConfig, motion } from 'motion/react';
+
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { BrandWordmark } from '@/components/brand-wordmark';
+import { AnimatedNumber, cardMotion, spring } from '@/components/motion-primitives';
+import { TramFill } from '@/components/tram-fill';
+import { API_BASE, WS_URL } from '@/lib/api';
 
 type Freshness = 'LIVE' | 'STALE' | 'OFFLINE' | 'SIMULATION';
 type VehicleMode = 'TRAM' | 'BUS';
@@ -70,6 +76,13 @@ type Vehicle = {
   freshness: Freshness;
   vehicleMode: VehicleMode;
   isSimulation: boolean;
+  mobilityAids?: MobilityAids | null;
+};
+
+type MobilityAids = {
+  wheelchairs: number;
+  strollers: number;
+  bicycles: number;
 };
 
 type VehiclesResponse = {
@@ -92,8 +105,42 @@ type FeedItem = {
   detail: string;
   at: Date;
   delaySeconds?: number | null;
+  loadFactor?: number | null;
+  occupancy?: Occupancy;
   vehicleMode?: VehicleMode;
   vehicleId?: string;
+};
+
+type Recommendation = {
+  id: string;
+  status: 'OPEN' | 'ACCEPTED' | 'DISMISSED';
+  routeId: string;
+  routeShortName: string;
+  directionId: number;
+  reason: {
+    loadFactor: number;
+    durationSeconds: number;
+    nextVehicleHeadwaySeconds: number;
+    measurementConfidence: number;
+  };
+  proposedAction: {
+    departureDelaySeconds: number;
+    capacity: number;
+    startStopId: string;
+    endStopId: string;
+  };
+  expectedImpact: {
+    estimatedWaitingPassengersServed: number;
+    passengerMinutesSaved: number;
+    projectedPeakLoadFactor: number;
+  };
+  createdAt: string;
+};
+
+type Dispatch = {
+  dispatchId: string;
+  vehicleId: string;
+  routeId: string;
 };
 
 type TrackingState = {
@@ -168,17 +215,13 @@ function trackingReducer(
   }
 }
 
-const API_BASE =
-  (import.meta.env.VITE_API_BASE_URL as string | undefined) ??
-  'http://localhost:8000/api/v1';
-const WS_URL = API_BASE.replace(/^http/, 'ws') + '/live';
 
 const occupancyMeta: Record<
   Occupancy,
   { label: string; color: string; text: string }
 > = {
   UNKNOWN: { label: 'Brak danych', color: '#7b8794', text: 'text-slate-500' },
-  LOW: { label: 'Niskie', color: '#00a99a', text: 'text-teal-700' },
+  LOW: { label: 'Niskie', color: '#00b3a4', text: 'text-teal-700' },
   MODERATE: { label: 'Umiarkowane', color: '#e4b63a', text: 'text-amber-700' },
   BUSY: { label: 'Wysokie', color: '#ef8d32', text: 'text-orange-700' },
   CROWDED: { label: 'Tłok', color: '#ee5b50', text: 'text-red-700' },
@@ -189,9 +232,40 @@ const occupancyMeta: Record<
   },
 };
 
+// A slow, watchable run for the pitch: the backend drives 900 simulated seconds,
+// so speed 5 keeps the reserve on the map for three minutes.
+const DISPATCH_SIMULATION_SPEED = 5;
+const RECOMMENDATIONS_REFRESH_MS = 5_000;
+// Mirrors the decision engine's overload threshold, shown on the capacity bar.
+const RESERVE_THRESHOLD = 0.85;
+// The feed's "Tłok" filter starts at the BUSY band, a step before the engine acts.
+const CROWDING_FEED_THRESHOLD = 0.7;
+const FOCUS_LAYER_IDS = [
+  'vehicle-halo',
+  'vehicle-marker',
+  'vehicle-label',
+  'vehicle-hit-area',
+] as const;
+
+function hasCounterReading(vehicle: Vehicle) {
+  return !vehicle.isSimulation && vehicle.loadFactor !== null;
+}
+
+function isCrowded(vehicle: Vehicle) {
+  return (
+    vehicle.occupancyStatus === 'CROWDED' ||
+    vehicle.occupancyStatus === 'OVER_CAPACITY'
+  );
+}
+
 function vehicleColor(vehicle: Vehicle) {
   if (hasStalePosition(vehicle)) return '#93a2a9';
   if (vehicle.isSimulation) return '#5267ff';
+  // Vehicles with a door counter wear their occupancy; the rest keep the mode
+  // color, so crowding is the thing that stands out on the map.
+  if (hasCounterReading(vehicle)) {
+    return occupancyMeta[vehicle.occupancyStatus].color;
+  }
   return vehicle.vehicleMode === 'BUS' ? '#168d93' : '#14a56c';
 }
 
@@ -214,6 +288,7 @@ const createVehicleGeoJson = (
       simulation: vehicle.isSimulation,
       mode: vehicle.vehicleMode,
       selected: vehicle.vehicleId === trackedVehicleId,
+      crowded: hasCounterReading(vehicle) && isCrowded(vehicle),
     },
   })),
 });
@@ -226,13 +301,6 @@ function formatTime(date: Date | string) {
   }).format(typeof date === 'string' ? new Date(date) : date);
 }
 
-function relativeDelay(delay: number | null) {
-  if (delay === null) return 'brak danych';
-  if (Math.abs(delay) < 30) return 'na czas';
-  const minutes = Math.max(1, Math.round(Math.abs(delay) / 60));
-  return delay > 0 ? `+${minutes} min` : `−${minutes} min`;
-}
-
 function delayBadge(delay: number | null | undefined) {
   if (delay === null || delay === undefined) return null;
 
@@ -243,6 +311,58 @@ function delayBadge(delay: number | null | undefined) {
   if (delay < 300) return { tone: 'moderate', label: `+${minutes} min` };
   if (delay < 600) return { tone: 'severe', label: `+${minutes} min` };
   return { tone: 'critical', label: `+${minutes} min` };
+}
+
+/** Two soft sine notes, synthesised, so the alert needs no audio asset. */
+function playChime() {
+  try {
+    const context = new AudioContext();
+    [660, 880].forEach((frequency, index) => {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      const start = context.currentTime + index * 0.14;
+      oscillator.type = 'sine';
+      oscillator.frequency.value = frequency;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.12, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.35);
+      oscillator.connect(gain).connect(context.destination);
+      oscillator.start(start);
+      oscillator.stop(start + 0.4);
+    });
+    window.setTimeout(() => void context.close(), 800);
+  } catch {
+    // Audio blocked before any user gesture; the visual alert still shows.
+  }
+}
+
+function plural(count: number, one: string, few: string, many: string) {
+  const lastTwo = count % 100;
+  const last = count % 10;
+  if (count === 1) return one;
+  if (last >= 2 && last <= 4 && (lastTwo < 12 || lastTwo > 14)) return few;
+  return many;
+}
+
+/** "1 wózek inwalidzki · 2 rowery", or null when the cabin camera sees none. */
+function describeAids(aids: MobilityAids | null | undefined) {
+  if (!aids) return null;
+  const parts = [
+    aids.wheelchairs > 0 &&
+      `${aids.wheelchairs} ${plural(aids.wheelchairs, 'wózek inwalidzki', 'wózki inwalidzkie', 'wózków inwalidzkich')}`,
+    aids.strollers > 0 &&
+      `${aids.strollers} ${plural(aids.strollers, 'wózek dziecięcy', 'wózki dziecięce', 'wózków dziecięcych')}`,
+    aids.bicycles > 0 &&
+      `${aids.bicycles} ${plural(aids.bicycles, 'rower', 'rowery', 'rowerów')}`,
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+function formatAgo(timestamp: string, now: number) {
+  const minutes = Math.floor((now - new Date(timestamp).getTime()) / 60_000);
+  if (minutes < 1) return 'przed chwilą';
+  if (minutes < 60) return `${minutes} min temu`;
+  return `${Math.floor(minutes / 60)} godz. temu`;
 }
 
 function formatPositionAge(positionMeasuredAt: string, now: number) {
@@ -287,6 +407,16 @@ export function UrbanFlowDashboard() {
   const [demoDialogOpen, setDemoDialogOpen] = useState(false);
   const [demoRouteId, setDemoRouteId] = useState('');
   const [addingDemo, setAddingDemo] = useState(false);
+  const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
+  const [dispatchingId, setDispatchingId] = useState<string | null>(null);
+  const [lastDispatch, setLastDispatch] = useState<Dispatch | null>(null);
+  const pendingFocusIdRef = useRef<string | null>(null);
+  const [stagedIds, setStagedIds] = useState<string[]>([]);
+  const [staging, setStaging] = useState(false);
+  const [feedFilter, setFeedFilter] = useState<'all' | 'crowding'>('all');
+  const [recommendationIndex, setRecommendationIndex] = useState(0);
+  const [freshRecommendationId, setFreshRecommendationId] = useState<string | null>(null);
+  const seenRecommendationIdsRef = useRef<Set<string> | null>(null);
 
   useEffect(() => {
     const interval = window.setInterval(() => setNow(Date.now()), 1_000);
@@ -335,13 +465,11 @@ export function UrbanFlowDashboard() {
                 ? ('warning' as const)
                 : ('update' as const),
             title: `Linia ${vehicle.routeShortName} · ${vehicle.headsign}`,
-            detail: `${
-              vehicle.loadFactor === null
-                ? 'Zapełnienie nieznane'
-                : `${Math.round(vehicle.loadFactor * 100)}% zapełnienia`
-            } · ${vehicle.nextStopName ?? 'w trasie'}`,
+            detail: vehicle.nextStopName ?? 'W trasie',
             at: new Date(vehicle.updatedAt),
             delaySeconds: vehicle.delaySeconds,
+            loadFactor: vehicle.loadFactor,
+            occupancy: vehicle.occupancyStatus,
             vehicleMode: vehicle.vehicleMode,
             vehicleId: vehicle.vehicleId,
           })),
@@ -357,12 +485,16 @@ export function UrbanFlowDashboard() {
 
   useEffect(() => {
     const initialRequest = window.setTimeout(() => void loadVehicles(), 0);
-    const interval = window.setInterval(() => void loadVehicles(true), 10_000);
-    return () => {
-      window.clearTimeout(initialRequest);
-      window.clearInterval(interval);
-    };
+    return () => window.clearTimeout(initialRequest);
   }, [loadVehicles]);
+
+  // Without the WebSocket, REST is the only source of movement; poll fast enough
+  // that a dispatched reserve still glides instead of jumping every ten seconds.
+  useEffect(() => {
+    const period = connection === 'live' ? 10_000 : 2_000;
+    const interval = window.setInterval(() => void loadVehicles(true), period);
+    return () => window.clearInterval(interval);
+  }, [connection, loadVehicles]);
 
   useEffect(() => {
     let socket: WebSocket | null = null;
@@ -410,10 +542,12 @@ export function UrbanFlowDashboard() {
                 ? 'warning'
                 : 'update',
             title: `Linia ${vehicle.routeShortName} · ${vehicle.headsign}`,
-            detail: `${vehicle.isSimulation ? 'Symulacja' : 'Nowa pozycja'} · ${
-              vehicle.nextStopName ?? 'w trasie'
+            detail: `${vehicle.isSimulation ? 'Symulacja · ' : ''}${
+              vehicle.nextStopName ?? 'W trasie'
             }`,
             delaySeconds: vehicle.delaySeconds,
+            loadFactor: vehicle.loadFactor,
+            occupancy: vehicle.occupancyStatus,
             vehicleMode: vehicle.vehicleMode,
             vehicleId: vehicle.vehicleId,
           });
@@ -425,6 +559,23 @@ export function UrbanFlowDashboard() {
             ...current.filter((vehicle) => vehicle.isSimulation),
           ]);
           dispatchTracking({ type: 'sync', vehicles: snapshot.vehicles });
+        }
+        if (message.type === 'recommendation.created') {
+          const recommendation = message.payload as unknown as Recommendation;
+          if (recommendation.status !== 'OPEN') return;
+          setRecommendations((current) =>
+            current.some((item) => item.id === recommendation.id)
+              ? current
+              : [recommendation, ...current],
+          );
+          addFeedItem({
+            kind: 'warning',
+            title: `Linia ${recommendation.routeShortName} przeładowana`,
+            detail: `${Math.round(recommendation.reason.loadFactor * 100)}% przez ${Math.round(
+              recommendation.reason.durationSeconds / 60,
+            )} min · proponujemy rezerwę`,
+          });
+          return;
         }
         if (message.type === 'vehicle.removed') {
           const payload = message.payload as { vehicleId: string };
@@ -448,6 +599,32 @@ export function UrbanFlowDashboard() {
       socket?.close();
     };
   }, [addFeedItem]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const [response, staged] = await Promise.all([
+          fetch(`${API_BASE}/recommendations?status=OPEN`),
+          fetch(`${API_BASE}/demo/overload`),
+        ]);
+        if (cancelled) return;
+        if (response.ok) setRecommendations((await response.json()) as Recommendation[]);
+        if (staged.ok) setStagedIds((await staged.json()) as string[]);
+      } catch {
+        // The vehicle poll already reports a lost backend; stay quiet here.
+      }
+    };
+    void load();
+    const interval = window.setInterval(
+      () => void load(),
+      RECOMMENDATIONS_REFRESH_MS,
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   const filteredVehicles = useMemo(
     () =>
@@ -489,6 +666,17 @@ export function UrbanFlowDashboard() {
     const vehicle = vehiclesByIdRef.current.get(vehicleId);
     if (vehicle) selectVehicle(vehicle);
   }, [selectVehicle]);
+
+  // A dispatched reserve reaches the map over the WebSocket a moment after the
+  // dispatch call returns; follow it as soon as it appears.
+  useEffect(() => {
+    const pendingId = pendingFocusIdRef.current;
+    if (!pendingId) return;
+    const vehicle = vehicles.find((item) => item.vehicleId === pendingId);
+    if (!vehicle) return;
+    pendingFocusIdRef.current = null;
+    selectVehicle(vehicle);
+  }, [selectVehicle, vehicles]);
 
   const clearSelectedVehicle = useCallback(() => {
     cameraModeRef.current = 'idle';
@@ -625,6 +813,8 @@ export function UrbanFlowDashboard() {
               'case',
               ['boolean', ['get', 'selected'], false],
               27,
+              ['boolean', ['get', 'crowded'], false],
+              30,
               18,
             ],
             'circle-color': ['get', 'color'],
@@ -632,6 +822,8 @@ export function UrbanFlowDashboard() {
               'case',
               ['boolean', ['get', 'selected'], false],
               0.3,
+              ['boolean', ['get', 'crowded'], false],
+              0.28,
               0.16,
             ],
           },
@@ -745,6 +937,24 @@ export function UrbanFlowDashboard() {
         map.on('mouseenter', 'vehicle-cluster-hit-area', showPointer);
         map.on('mouseleave', 'vehicle-hit-area', hidePointer);
         map.on('mouseleave', 'vehicle-cluster-hit-area', hidePointer);
+        // The tracked vehicle and crowded trams never hide inside a cluster: they
+        // get their own unclustered source, drawn above everything else.
+        map.addSource('vehicles-focus', {
+          type: 'geojson',
+          data: createVehicleGeoJson([]),
+        });
+        for (const id of FOCUS_LAYER_IDS) {
+          const layer = map.getLayer(id)?.serialize() as LayerSpecification | undefined;
+          if (!layer) continue;
+          map.addLayer({
+            ...layer,
+            id: `${id}-focus`,
+            source: 'vehicles-focus',
+          } as LayerSpecification);
+        }
+        map.on('click', 'vehicle-hit-area-focus', selectVehicle);
+        map.on('mouseenter', 'vehicle-hit-area-focus', showPointer);
+        map.on('mouseleave', 'vehicle-hit-area-focus', hidePointer);
         setMapReady(true);
       });
       mapRef.current = map;
@@ -780,8 +990,20 @@ export function UrbanFlowDashboard() {
         pixelRatio: 2,
       });
     });
+    const isFocused = (vehicle: Vehicle) =>
+      vehicle.vehicleId === tracking.vehicleId ||
+      (hasCounterReading(vehicle) && isCrowded(vehicle));
     void source.setData(
-      createVehicleGeoJson(filteredVehicles, tracking.vehicleId),
+      createVehicleGeoJson(
+        filteredVehicles.filter((vehicle) => !isFocused(vehicle)),
+        tracking.vehicleId,
+      ),
+    );
+    const focusSource = map.getSource('vehicles-focus') as
+      | GeoJSONSource
+      | undefined;
+    void focusSource?.setData(
+      createVehicleGeoJson(filteredVehicles.filter(isFocused), tracking.vehicleId),
     );
   }, [filteredVehicles, mapReady, tracking.vehicleId]);
 
@@ -950,6 +1172,187 @@ export function UrbanFlowDashboard() {
     }
   };
 
+  // The pill reports whether the map is current, not which transport carried it:
+  // REST polling every two seconds is still live data.
+  const feedStatus: 'live' | 'polling' | 'offline' =
+    connection === 'live' ? 'live' : error ? 'offline' : 'polling';
+
+  // "Tłok" is the current state of the network, not feed history: every counted
+  // vehicle above the threshold, fullest first.
+  const visibleFeed: FeedItem[] =
+    feedFilter === 'all'
+      ? feed
+      : vehicles
+          .filter(
+            (vehicle) =>
+              hasCounterReading(vehicle) &&
+              (vehicle.loadFactor ?? 0) >= CROWDING_FEED_THRESHOLD,
+          )
+          .sort((a, b) => (b.loadFactor ?? 0) - (a.loadFactor ?? 0))
+          .map((vehicle) => ({
+            id: `crowded-${vehicle.vehicleId}`,
+            kind: isCrowded(vehicle) ? 'warning' : 'update',
+            title: `Linia ${vehicle.routeShortName} · ${vehicle.headsign}`,
+            detail:
+              vehicle.passengerCount !== null && vehicle.capacity !== null
+                ? `${vehicle.passengerCount} z ${vehicle.capacity} osób · ${vehicle.nextStopName ?? 'w trasie'}`
+                : (vehicle.nextStopName ?? 'W trasie'),
+            at: new Date(vehicle.updatedAt),
+            delaySeconds: vehicle.delaySeconds,
+            loadFactor: vehicle.loadFactor,
+            occupancy: vehicle.occupancyStatus,
+            vehicleMode: vehicle.vehicleMode,
+            vehicleId: vehicle.vehicleId,
+          }));
+
+  const sortedRecommendations = useMemo(
+    () =>
+      [...recommendations].sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      ),
+    [recommendations],
+  );
+  const activeRecommendation =
+    sortedRecommendations[
+      Math.min(recommendationIndex, sortedRecommendations.length - 1)
+    ] ?? null;
+
+  // Same direction first; a tram that reached its terminus and turned back is
+  // still the one the recommendation is about.
+  const crowdedVehicleFor = (recommendation: Recommendation) =>
+    vehicles
+      .filter(
+        (vehicle) =>
+          vehicle.routeId === recommendation.routeId &&
+          hasCounterReading(vehicle),
+      )
+      .sort(
+        (a, b) =>
+          Number(b.directionId === recommendation.directionId) -
+            Number(a.directionId === recommendation.directionId) ||
+          (b.loadFactor ?? 0) - (a.loadFactor ?? 0),
+      )[0];
+
+  const showRecommendedVehicle = (recommendation: Recommendation) => {
+    const vehicle = crowdedVehicleFor(recommendation);
+    if (vehicle) selectVehicle(vehicle);
+  };
+
+  const sendReserve = async (recommendation: Recommendation) => {
+    setDispatchingId(recommendation.id);
+    try {
+      const response = await fetch(`${API_BASE}/mock-dispatch/extra-trams`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recommendationId: recommendation.id,
+          routeId: recommendation.routeId,
+          directionId: recommendation.directionId,
+          startStopId: recommendation.proposedAction.startStopId,
+          endStopId: recommendation.proposedAction.endStopId,
+          capacity: recommendation.proposedAction.capacity,
+          departureDelaySeconds: 0,
+          simulationSpeed: DISPATCH_SIMULATION_SPEED,
+        }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const dispatch = (await response.json()) as Dispatch;
+      setRecommendations((current) =>
+        current.filter((item) => item.id !== recommendation.id),
+      );
+      setLastDispatch(dispatch);
+      setShowDemo(true);
+      pendingFocusIdRef.current = dispatch.vehicleId;
+      addFeedItem({
+        kind: 'system',
+        title: `Rezerwa wysłana na linię ${recommendation.routeShortName}`,
+        detail: `${dispatch.vehicleId} rusza trasą linii`,
+        vehicleId: dispatch.vehicleId,
+        vehicleMode: 'TRAM',
+      });
+    } catch {
+      setError('Nie udało się wysłać rezerwy. Spróbuj ponownie.');
+    } finally {
+      setDispatchingId(null);
+    }
+  };
+
+  // A recommendation that arrives while the dashboard is open gets announced: the
+  // card jumps to it, pulses and chimes. Ones already open at load are not news.
+  useEffect(() => {
+    const ids = recommendations.map((item) => item.id);
+    const seen = seenRecommendationIdsRef.current;
+    seenRecommendationIdsRef.current = new Set([...(seen ?? []), ...ids]);
+    if (!seen) return;
+    const arrived = sortedRecommendations.find((item) => !seen.has(item.id));
+    if (!arrived) return;
+    setRecommendationIndex(0);
+    setFreshRecommendationId(arrived.id);
+    playChime();
+    const timer = window.setTimeout(() => setFreshRecommendationId(null), 5_000);
+    return () => window.clearTimeout(timer);
+  }, [recommendations, sortedRecommendations]);
+
+  useEffect(() => {
+    document.title =
+      recommendations.length > 0
+        ? `(${recommendations.length}) UrbanFlow — centrum operacyjne`
+        : 'UrbanFlow — centrum operacyjne';
+  }, [recommendations.length]);
+
+  const stageOverload = async () => {
+    setStaging(true);
+    try {
+      const response = await fetch(`${API_BASE}/demo/overload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const vehicle = (await response.json()) as Vehicle;
+      setStagedIds((current) => [...new Set([...current, vehicle.vehicleId])]);
+      setVehicles((current) =>
+        current.map((item) => (item.vehicleId === vehicle.vehicleId ? vehicle : item)),
+      );
+      setShowReal(true);
+      selectVehicle(vehicle);
+      addFeedItem({
+        kind: 'warning',
+        title: `Linia ${vehicle.routeShortName} · ${vehicle.headsign}`,
+        detail: `${vehicle.passengerCount ?? '—'} z ${vehicle.capacity ?? '—'} osób · rekomendacja za ok. 2 min`,
+        loadFactor: vehicle.loadFactor,
+        occupancy: vehicle.occupancyStatus,
+        vehicleId: vehicle.vehicleId,
+        vehicleMode: vehicle.vehicleMode,
+      });
+    } catch {
+      setError('Nie udało się zasymulować tłoku. Czy na mapie są tramwaje?');
+    } finally {
+      setStaging(false);
+    }
+  };
+
+  const stopOverload = async (vehicleId: string) => {
+    setStagedIds((current) => current.filter((id) => id !== vehicleId));
+    await fetch(`${API_BASE}/demo/overload/${encodeURIComponent(vehicleId)}`, {
+      method: 'DELETE',
+    }).catch(() => undefined);
+  };
+
+  const dismissRecommendation = async (recommendation: Recommendation) => {
+    setRecommendations((current) =>
+      current.filter((item) => item.id !== recommendation.id),
+    );
+    await fetch(
+      `${API_BASE}/recommendations/${encodeURIComponent(recommendation.id)}/dismiss`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'Odrzucone przez dyspozytora' }),
+      },
+    ).catch(() => undefined);
+  };
+
   const realTramCount = vehicles.filter(
     (vehicle) => !vehicle.isSimulation && vehicle.vehicleMode === 'TRAM',
   ).length;
@@ -959,35 +1362,38 @@ export function UrbanFlowDashboard() {
   const demoCount = vehicles.filter((vehicle) => vehicle.isSimulation).length;
 
   return (
+    <MotionConfig reducedMotion="user">
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand" aria-label="UrbanFlow">
-          <Image
-            src="/logo.svg"
-            alt="UrbanFlow"
-            className="brand-logo"
-            width={42}
-            height={42}
-            priority
-          />
-        </div>
+        <Link href="/" className="brand" aria-label="UrbanFlow — strona główna">
+          <BrandWordmark size={26} />
+        </Link>
         <div className="topbar-center">
           <span className="city-label"><MapPin /> Kraków</span>
         </div>
         <div className="topbar-actions">
           <Button
+            className="stage-overload-button"
+            disabled={staging}
+            onClick={() => void stageOverload()}
+          >
+            {staging ? <RefreshCw className="animate-spin" /> : <Users />}
+            Symuluj tłok
+          </Button>
+          <Button
+            variant="outline"
             className="add-demo-button"
             onClick={() => setDemoDialogOpen(true)}
           >
             <Plus /> Dodaj demo
           </Button>
-          <div className={`connection-pill ${connection}`}>
+          <div className={`connection-pill ${feedStatus}`}>
             <span className="status-dot" />
-            {connection === 'live'
+            {feedStatus === 'live'
               ? 'Dane na żywo'
-              : connection === 'connecting'
-                ? 'Łączenie…'
-                : 'Ponawianie…'}
+              : feedStatus === 'polling'
+                ? 'Dane na żywo · co 2 s'
+                : 'Brak połączenia'}
           </div>
           <Button
             variant="outline"
@@ -1013,117 +1419,268 @@ export function UrbanFlowDashboard() {
             <LocateFixed />
           </button>
 
+          <AnimatePresence>
           {error && (
-            <output className="error-toast">
+            <motion.output
+              className="error-toast"
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={spring}
+            >
               <WifiOff />
               <span>{error}</span>
               <button type="button" onClick={() => setError(null)} aria-label="Zamknij"><X /></button>
-            </output>
+            </motion.output>
           )}
+          </AnimatePresence>
 
+          <AnimatePresence mode="popLayout">
+          {activeRecommendation && (
+            <motion.article
+              key={activeRecommendation.id}
+              {...cardMotion}
+              className={`recommendation-card${
+                freshRecommendationId === activeRecommendation.id ? ' is-fresh' : ''
+              }`}
+              aria-live="assertive"
+              aria-labelledby="recommendation-title"
+            >
+              <div className="rec-meta">
+                <span className="rec-dot" aria-hidden="true" />
+                {freshRecommendationId === activeRecommendation.id ? (
+                  <span className="rec-new">Nowa rekomendacja</span>
+                ) : (
+                  <span>
+                    Rekomendacja · {formatAgo(activeRecommendation.createdAt, now)}
+                  </span>
+                )}
+                {sortedRecommendations.length > 1 && (
+                  <span className="rec-pager">
+                    <button
+                      type="button"
+                      aria-label="Poprzednia rekomendacja"
+                      disabled={recommendationIndex === 0}
+                      onClick={() => setRecommendationIndex((index) => index - 1)}
+                    >
+                      <ChevronLeft />
+                    </button>
+                    <span>
+                      {recommendationIndex + 1} z {sortedRecommendations.length}
+                    </span>
+                    <button
+                      type="button"
+                      aria-label="Następna rekomendacja"
+                      disabled={recommendationIndex >= sortedRecommendations.length - 1}
+                      onClick={() => setRecommendationIndex((index) => index + 1)}
+                    >
+                      <ChevronRight />
+                    </button>
+                  </span>
+                )}
+              </div>
+              <strong id="recommendation-title" className="rec-title">
+                Linia {activeRecommendation.routeShortName} jest przepełniona
+              </strong>
+              <p className="rec-facts">
+                <span className="rec-load">
+                  {Math.round(activeRecommendation.reason.loadFactor * 100)}%
+                </span>{' '}
+                zapełnienia przez{' '}
+                {Math.round(activeRecommendation.reason.durationSeconds / 60)} min ·
+                rezerwa na {activeRecommendation.proposedAction.capacity} miejsc
+              </p>
+              <div className="recommendation-actions">
+                <Button
+                  size="sm"
+                  className="send-reserve-button"
+                  disabled={dispatchingId === activeRecommendation.id}
+                  onClick={() => void sendReserve(activeRecommendation)}
+                >
+                  {dispatchingId === activeRecommendation.id && (
+                    <RefreshCw className="animate-spin" />
+                  )}
+                  Wyślij rezerwę
+                </Button>
+                {crowdedVehicleFor(activeRecommendation) && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => showRecommendedVehicle(activeRecommendation)}
+                  >
+                    Pokaż tramwaj
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="dismiss-button"
+                  onClick={() => void dismissRecommendation(activeRecommendation)}
+                >
+                  Odrzuć
+                </Button>
+              </div>
+            </motion.article>
+          )}
+          </AnimatePresence>
+
+          <AnimatePresence>
+          {!activeRecommendation && lastDispatch && (
+            <motion.output className="dispatch-toast" {...cardMotion}>
+              <Send />
+              <span>
+                <strong>{lastDispatch.vehicleId}</strong> jedzie jako rezerwa
+              </span>
+              <button
+                type="button"
+                onClick={() => selectVehicleById(lastDispatch.vehicleId)}
+              >
+                Śledź
+              </button>
+              <button
+                type="button"
+                aria-label="Zamknij"
+                onClick={() => setLastDispatch(null)}
+              ><X /></button>
+            </motion.output>
+          )}
+          </AnimatePresence>
+
+          <AnimatePresence>
           {selectedVehicle && (
-            <article
+            <motion.article
               ref={trackingCardRef}
               className="vehicle-card"
+              initial={{ opacity: 0, y: 16, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 12, scale: 0.98, transition: { duration: 0.15 } }}
+              transition={spring}
               aria-label={`Śledzony pojazd linii ${selectedVehicle.routeShortName}`}
               aria-live="polite"
             >
-              <div className="vehicle-card-topline">
-                <div className="vehicle-route">
-                  <span style={{ background: vehicleColor(selectedVehicle) }}>
-                    {selectedVehicle.routeShortName}
+              <header className="vc-head">
+                <span className="vc-line" style={{ background: vehicleColor(selectedVehicle) }}>
+                  {selectedVehicle.routeShortName}
+                </span>
+                <div className="vc-title">
+                  <strong>{selectedVehicle.headsign}</strong>
+                  <span>
+                    {selectedVehicle.nextStopName
+                      ? `Następny: ${selectedVehicle.nextStopName}`
+                      : 'W trasie'}
+                    {selectedDelayBadge && (
+                      <>
+                        {' · '}
+                        <span className={`vc-delay ${selectedDelayBadge.tone}`}>
+                          {selectedDelayBadge.label}
+                        </span>
+                      </>
+                    )}
                   </span>
-                  <div>
-                    <small>
-                      {selectedVehicle.isSimulation
-                        ? 'Wirtualny pojazd demo'
-                        : selectedVehicle.vehicleMode === 'BUS'
-                          ? 'Autobus ZTP'
-                          : 'Tramwaj ZTP'}{' '}
-                      · {selectedVehicle.vehicleId.split(':').at(-1)}
-                    </small>
-                    <strong>{selectedVehicle.headsign}</strong>
+                </div>
+                <div className="vc-actions">
+                  <button
+                    type="button"
+                    className="vc-icon"
+                    aria-pressed={tracking.isFollowing}
+                    aria-label={tracking.isFollowing ? 'Wstrzymaj śledzenie' : 'Śledź pojazd'}
+                    title={tracking.isFollowing ? 'Wstrzymaj śledzenie' : 'Śledź pojazd'}
+                    onClick={toggleVehicleFollowing}
+                  >
+                    <LocateFixed />
+                  </button>
+                  <button
+                    type="button"
+                    className="vc-icon"
+                    aria-label="Zamknij szczegóły"
+                    onClick={clearSelectedVehicle}
+                  >
+                    <X />
+                  </button>
+                </div>
+              </header>
+
+              {selectedVehicle.loadFactor !== null ? (
+                <section className="vc-load" aria-label="Zapełnienie">
+                  <div className="vc-load-row">
+                    <strong
+                      className="vc-load-value"
+                      style={
+                        isCrowded(selectedVehicle) ||
+                        selectedVehicle.occupancyStatus === 'BUSY'
+                          ? { color: occupancyMeta[selectedVehicle.occupancyStatus].color }
+                          : undefined
+                      }
+                    >
+                      <AnimatedNumber value={Math.round(selectedVehicle.loadFactor * 100)} />%
+                    </strong>
+                    <span className="vc-load-label">
+                      {occupancyMeta[selectedVehicle.occupancyStatus].label}
+                    </span>
+                    {selectedVehicle.passengerCount !== null &&
+                      selectedVehicle.capacity !== null && (
+                        <span className="vc-load-count">
+                          {selectedVehicle.passengerCount} / {selectedVehicle.capacity} osób
+                        </span>
+                      )}
                   </div>
-                </div>
-                <button type="button" aria-label="Zamknij szczegóły" onClick={clearSelectedVehicle}><X /></button>
-              </div>
-              <div
-                className={`tracking-strip ${
-                  tracking.isTemporarilyMissing
-                    ? 'missing'
-                    : tracking.isFollowing
-                      ? 'active'
-                      : 'paused'
-                }`}
-              >
-                <LocateFixed />
-                <div>
-                  <strong>
-                    {tracking.isTemporarilyMissing
-                      ? 'Ostatnia znana pozycja'
-                      : tracking.isFollowing
-                        ? 'Śledzenie aktywne'
-                        : 'Śledzenie wstrzymane'}
-                  </strong>
-                  <small>
-                    {tracking.isTemporarilyMissing
-                      ? `Ostatnie dane ${selectedPositionAge}`
-                      : tracking.isFollowing
-                        ? 'Mapa podąża za pojazdem'
-                        : 'Pozycja nadal aktualizuje się w tle'}
-                  </small>
-                </div>
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="secondary"
-                  onClick={toggleVehicleFollowing}
-                >
-                  {tracking.isFollowing ? 'Wstrzymaj' : 'Wznów'}
-                </Button>
-              </div>
-              <div className="vehicle-next-stop">
-                <Route />
-                <div>
-                  <small>Następny przystanek</small>
-                  <strong>{selectedVehicle.nextStopName ?? 'Brak danych'}</strong>
-                </div>
-                <ChevronRight />
-              </div>
-              <div className="vehicle-metrics">
-                <div>
-                  <span><Users /> Zapełnienie</span>
-                  <strong className={occupancyMeta[selectedVehicle.occupancyStatus].text}>
-                    {selectedVehicle.loadFactor !== null
-                      ? `${Math.round(selectedVehicle.loadFactor * 100)}%`
-                      : '—'}
-                  </strong>
-                  <small>{occupancyMeta[selectedVehicle.occupancyStatus].label}</small>
-                </div>
-                <div>
-                  <span><Clock3 /> Opóźnienie</span>
-                  <strong className={`delay-value${selectedDelayBadge ? ` ${selectedDelayBadge.tone}` : ''}`}>
-                    {relativeDelay(selectedVehicle.delaySeconds)}
-                  </strong>
-                  <small>względem rozkładu GTFS</small>
-                </div>
-              </div>
-              <footer>
-                <span><span className="status-dot" /> {selectedVehicle.freshness}</span>
+                  {selectedVehicle.passengerCount !== null &&
+                  selectedVehicle.capacity !== null ? (
+                    <TramFill
+                      passengers={selectedVehicle.passengerCount}
+                      capacity={selectedVehicle.capacity}
+                      color={occupancyMeta[selectedVehicle.occupancyStatus].color}
+                    />
+                  ) : null}
+                  {describeAids(selectedVehicle.mobilityAids) && (
+                    <p className="vc-aids">
+                      <Accessibility aria-hidden="true" />
+                      W środku też: {describeAids(selectedVehicle.mobilityAids)}
+                    </p>
+                  )}
+                  <p className="vc-threshold-note">
+                    Rezerwa proponowana od {RESERVE_THRESHOLD * 100}% zapełnienia przez 2 min
+                  </p>
+                </section>
+              ) : (
+                <p className="vc-load-empty">
+                  Zapełnienie nieznane — ten pojazd nie ma licznika pasażerów.
+                </p>
+              )}
+
+              <footer className="vc-foot">
+                <span>
+                  {selectedVehicle.isSimulation
+                    ? 'Pojazd demo'
+                    : `${selectedVehicle.vehicleMode === 'BUS' ? 'Autobus' : 'Tramwaj'} ${selectedVehicle.vehicleId.split(':').at(-1)}`}
+                  {' · '}
+                  {tracking.isTemporarilyMissing
+                    ? `ostatnia pozycja ${selectedPositionAge}`
+                    : `pozycja ${selectedPositionAge}`}
+                </span>
                 {selectedVehicle.isSimulation ? (
                   <button
                     type="button"
-                    className="remove-demo-button"
+                    className="vc-link"
                     onClick={() => void removeDemoVehicle(selectedVehicle.vehicleId)}
                   >
                     Usuń demo
                   </button>
                 ) : (
-                  <span>Pozycja {selectedPositionAge}</span>
+                  stagedIds.includes(selectedVehicle.vehicleId) && (
+                    <button
+                      type="button"
+                      className="vc-link"
+                      onClick={() => void stopOverload(selectedVehicle.vehicleId)}
+                    >
+                      Zakończ symulację
+                    </button>
+                  )
                 )}
               </footer>
-            </article>
+            </motion.article>
           )}
+          </AnimatePresence>
 
           <button type="button" className="mobile-feed-toggle" onClick={() => setMobilePanel(true)}>
             <Radio /> Live feed
@@ -1143,10 +1700,29 @@ export function UrbanFlowDashboard() {
 
         <aside className={`activity-panel ${mobilePanel ? 'mobile-open' : ''}`}>
           <div className="panel-header">
-            <div>
-              <span className="eyebrow">Aktualizacje</span>
-              <h2>Live feed</h2>
-            </div>
+            <h2>Na żywo</h2>
+            <fieldset className="feed-filter" aria-label="Filtr zdarzeń">
+              <button
+                type="button"
+                aria-pressed={feedFilter === 'all'}
+                onClick={() => setFeedFilter('all')}
+              >
+                {feedFilter === 'all' && (
+                  <motion.span layoutId="feed-filter-pill" className="feed-filter-pill" transition={spring} />
+                )}
+                <span>Wszystkie</span>
+              </button>
+              <button
+                type="button"
+                aria-pressed={feedFilter === 'crowding'}
+                onClick={() => setFeedFilter('crowding')}
+              >
+                {feedFilter === 'crowding' && (
+                  <motion.span layoutId="feed-filter-pill" className="feed-filter-pill" transition={spring} />
+                )}
+                <span>Tłok</span>
+              </button>
+            </fieldset>
             <button type="button" className="mobile-close" aria-label="Zamknij panel" onClick={() => setMobilePanel(false)}><X /></button>
             <button
               type="button"
@@ -1156,40 +1732,54 @@ export function UrbanFlowDashboard() {
             >
               <PanelRightClose />
             </button>
-            <span className="live-wave"><i /><i /><i /></span>
           </div>
 
           <div className="network-summary">
             <div>
               <span><TramFront /> Tramwaje</span>
-              <strong>{realTramCount}</strong>
+              <strong><AnimatedNumber value={realTramCount} /></strong>
             </div>
             <div>
               <span><BusFront /> Autobusy</span>
-              <strong>{realBusCount}</strong>
+              <strong><AnimatedNumber value={realBusCount} /></strong>
             </div>
             <div className="demo-stat">
               <span><Activity /> Demo</span>
-              <strong>{demoCount}</strong>
+              <strong><AnimatedNumber value={demoCount} /></strong>
             </div>
           </div>
 
           <div className="feed-list">
-            {feed.length === 0 ? (
+            {visibleFeed.length === 0 && feedFilter === 'crowding' ? (
+              <div className="feed-empty">
+                <strong>Żaden pojazd nie jest teraz zatłoczony</strong>
+                <p>Tu pojawią się tramwaje z licznikiem powyżej 70% zapełnienia.</p>
+              </div>
+            ) : feed.length === 0 ? (
               <div className="feed-empty">
                 <span><Wifi /></span>
                 <strong>Nasłuchujemy sieci</strong>
                 <p>Nowe pozycje i alerty pojawią się tutaj automatycznie.</p>
               </div>
             ) : (
-              feed.map((item) => {
+              <AnimatePresence initial={false}>
+              {visibleFeed.map((item) => {
                 const badge = delayBadge(item.delaySeconds);
+                const load =
+                  item.loadFactor !== null && item.loadFactor !== undefined
+                    ? Math.round(item.loadFactor * 100)
+                    : null;
                 const canTrack = Boolean(item.vehicleId);
                 const trackVehicle = () => {
                   if (item.vehicleId) selectVehicleById(item.vehicleId);
                 };
                 return (
-                  <button
+                  <motion.button
+                    layout="position"
+                    initial={{ opacity: 0, y: -6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, transition: { duration: 0.12 } }}
+                    transition={{ duration: 0.25, ease: [0.23, 1, 0.32, 1] }}
                     type="button"
                     className={`feed-item ${item.kind}${item.vehicleMode ? ` mode-${item.vehicleMode.toLowerCase()}` : ''}${canTrack ? ' trackable' : ''}`}
                     key={item.id}
@@ -1197,22 +1787,32 @@ export function UrbanFlowDashboard() {
                     title={canTrack ? 'Pokaż i śledź pojazd na mapie' : undefined}
                     onClick={canTrack ? trackVehicle : undefined}
                   >
-                    <span className="feed-icon">
-                      {item.kind === 'warning' ? <AlertTriangle /> : item.kind === 'system' ? <Wifi /> : <ArrowDownRight />}
-                    </span>
+                    <span className="feed-marker" aria-hidden="true" />
                     <div>
                       <time>{formatTime(item.at)}</time>
                       <strong>{item.title}</strong>
                       <p>{item.detail}</p>
                     </div>
-                    {badge && (
-                      <span className={`feed-delay ${badge.tone}`} aria-label={`Opóźnienie: ${badge.label}`}>
-                        {badge.label}
-                      </span>
-                    )}
-                  </button>
+                    <span className="feed-values">
+                      {load !== null && item.occupancy && (
+                        <span
+                          className="feed-load"
+                          style={{ color: occupancyMeta[item.occupancy].color }}
+                          aria-label={`Zapełnienie: ${load}%, ${occupancyMeta[item.occupancy].label}`}
+                        >
+                          {load}%
+                        </span>
+                      )}
+                      {badge && (
+                        <span className={`feed-delay ${badge.tone}`} aria-label={`Opóźnienie: ${badge.label}`}>
+                          {badge.label}
+                        </span>
+                      )}
+                    </span>
+                  </motion.button>
                 );
-              })
+              })}
+              </AnimatePresence>
             )}
           </div>
 
@@ -1253,23 +1853,35 @@ export function UrbanFlowDashboard() {
                 <option value={routeId} key={routeId}>{shortName}</option>
               ))}
             </select>
-            <div className="legend">
-              <span><i className="tram" /> Tramwaj</span>
-              <span><i className="bus" /> Autobus</span>
-              <span><i className="demo" /> Demo</span>
-            </div>
           </section>
 
-          <footer className="panel-footer">
-            <span><span className="status-dot" /> WebSocket</span>
-            <span>REST co 10 s</span>
+          <footer className={`panel-footer ${feedStatus}`}>
+            <span>
+              <span className="status-dot" />
+              {feedStatus === 'live'
+                ? 'Aktualizacje przez WebSocket'
+                : feedStatus === 'polling'
+                  ? 'WebSocket niedostępny, odświeżanie co 2 s'
+                  : 'Backend nie odpowiada'}
+            </span>
           </footer>
         </aside>
       </section>
 
+      <AnimatePresence>
       {demoDialogOpen && (
-        <div className="dialog-backdrop">
-          <dialog
+        <motion.div
+          className="dialog-backdrop"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0, transition: { duration: 0.12 } }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.dialog
+            initial={{ opacity: 0, y: 12, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 8, scale: 0.98, transition: { duration: 0.12 } }}
+            transition={spring}
             open
             className="demo-dialog"
             aria-modal="true"
@@ -1312,9 +1924,11 @@ export function UrbanFlowDashboard() {
                 Dodaj na mapę
               </Button>
             </div>
-          </dialog>
-        </div>
+          </motion.dialog>
+        </motion.div>
       )}
+      </AnimatePresence>
     </main>
+    </MotionConfig>
   );
 }
