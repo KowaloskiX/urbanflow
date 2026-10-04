@@ -7,3 +7,9 @@ node_modules/
 .DS_Store
 *.py[cod]
 devices.local.json
+
+# Build output
+*.tsbuildinfo
+dist/
+.wrangler/
+frontend/.next/
