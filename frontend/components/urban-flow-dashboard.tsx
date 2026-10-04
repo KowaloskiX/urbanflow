@@ -1,6 +1,5 @@
 'use client';
 
-import Link from 'next/link';
 import {
   useCallback,
   useEffect,
@@ -1366,9 +1365,10 @@ export function UrbanFlowDashboard() {
     <MotionConfig reducedMotion="user">
     <main className="app-shell">
       <header className="topbar">
-        <Link href="/" className="brand" aria-label="UrbanFlow — strona główna">
+        {/* oxlint-disable-next-line no-html-link-for-pages -- vinext client navigation does not run in the production build; a full page load does. */}
+        <a href="/" className="brand" aria-label="UrbanFlow — strona główna">
           <BrandWordmark size={26} />
-        </Link>
+        </a>
         <div className="topbar-center">
           <span className="city-label"><MapPin /> Kraków</span>
         </div>

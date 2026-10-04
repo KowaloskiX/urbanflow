@@ -1,7 +1,6 @@
 'use client';
 
 import Image from 'next/image';
-import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
 import { ArrowRight } from 'lucide-react';
 import { MotionConfig, motion, stagger, useScroll, useTransform } from 'motion/react';
@@ -179,8 +178,6 @@ const nextSteps = [
   },
 ];
 
-const MotionLink = motion.create(Link);
-
 function PillLink({
   href,
   children,
@@ -191,7 +188,7 @@ function PillLink({
   tone?: 'light' | 'dark';
 }) {
   return (
-    <MotionLink
+    <motion.a
       href={href}
       className={`pill ${tone}`}
       whileTap={{ scale: 0.97 }}
@@ -201,7 +198,7 @@ function PillLink({
       <span className="pill-arrow" aria-hidden="true">
         <ArrowRight />
       </span>
-    </MotionLink>
+    </motion.a>
   );
 }
 
@@ -257,9 +254,10 @@ export function PitchPage() {
     <MotionConfig reducedMotion="user">
     <div className="pitch">
       <header className={`pitch-nav${scrolled ? ' solid' : ''}`}>
-        <Link href="/" className="pitch-brand" aria-label="UrbanFlow">
+        {/* oxlint-disable-next-line no-html-link-for-pages -- vinext client navigation does not run in the production build; a full page load does. */}
+        <a href="/" className="pitch-brand" aria-label="UrbanFlow">
           <BrandWordmark size={28} tone={scrolled ? 'dark' : 'light'} />
-        </Link>
+        </a>
         <nav aria-label="Sekcje">
           <a href="#jak-to-dziala">Jak to działa</a>
           <a href="#demo">Demo</a>
