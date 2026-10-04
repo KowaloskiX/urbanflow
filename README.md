@@ -1,115 +1,193 @@
+<div align="center">
+
+<img src="docs/brand/logo.svg" alt="UrbanFlow" width="140">
+
 # UrbanFlow
 
-UrbanFlow to centrum operacyjne do monitorowania komunikacji miejskiej (tramwajów i autobusów) w Krakowie w czasie rzeczywistym. System integruje dane na żywo, wizualizuje je na interaktywnej mapie i wspiera decyzje dyspozytorskie.
+**Widzimy, który tramwaj jest pełny.**
 
-## Architektura projektu
+Kamera liczy pasażerów, mapa pokazuje zapełnienie krakowskich tramwajów na żywo,
+a dyspozytor dostaje gotową propozycję dodatkowego kursu.
 
-Projekt składa się z trzech głównych modułów:
+</div>
 
-- **Frontend (`/frontend`)**
-  - Aplikacja webowa (React, Next.js/Vinext) prezentująca interaktywny panel dyspozytorski.
-  - Wykorzystuje MapLibre GL JS do wizualizacji map wektorowych.
-  - Odbiera dane w czasie rzeczywistym (WebSocket) i obsługuje symulacje (demo).
-  
-- **Backend (`/backend`)**
-  - Serwer API oparty o FastAPI (Python).
-  - Integruje dane GTFS-Realtime z krakowskiego ZTP.
-  - Utrzymuje stan pojazdów (State Store) i rozgłasza aktualizacje do klientów podłączonych przez WebSocket.
-  - Obsługuje logikę "pojazdów demo" dla celów symulacyjnych.
+![Strona UrbanFlow: przystanek z góry, model zaznacza wsiadających i wysiadających](docs/media/landing.jpg)
 
-- **Decision Making Engine (`/DecisionMakingAlgo`)**
-  - Zaawansowany moduł (algorytm) wspomagający proces decyzyjny przy zarządzaniu flotą i reakcji na incydenty w sieci komunikacyjnej.
+## Spis treści
 
-## Uruchomienie lokalne
+- [Co robi](#co-robi)
+- [Jak to działa](#jak-to-działa)
+- [Szybki start](#szybki-start)
+- [Demo w pięć minut](#demo-w-pięć-minut)
+- [Licznik pasażerów](#licznik-pasażerów)
+- [API](#api)
+- [Struktura repozytorium](#struktura-repozytorium)
+- [Testy](#testy)
+- [Stan prototypu](#stan-prototypu)
+- [Materiały i podziękowania](#materiały-i-podziękowania)
 
-### Wymagania
-- Node.js (dla frontendu)
-- Python 3.10+ (dla backendu)
-- [uv](https://github.com/astral-sh/uv) (menedżer pakietów Python) lub pip
-- Docker & Docker Compose (opcjonalnie, do konteneryzacji)
+## Co robi
 
-### Szybki start (Docker)
-Wystarczy użyć pliku `docker-compose.yml`, aby podnieść całe środowisko:
-```bash
-docker compose up -d
+Feed GTFS-Realtime ZTP Kraków mówi, gdzie jest każdy tramwaj i ile ma opóźnienia. Nie mówi,
+ilu ludzi jest w środku. UrbanFlow dokłada tę informację:
+
+- **Liczy pasażerów kamerą.** Nad drzwiami: kto wsiada, kto wysiada. W wagonie: ile osób,
+  wózków inwalidzkich, wózków dziecięcych i rowerów jest w środku.
+- **Pokazuje zapełnienie na mapie na żywo.** Każdy tramwaj z licznikiem ma swój kolor i kartę
+  z widokiem wnętrza.
+- **Proponuje rezerwę.** Gdy tramwaj jest pełny (≥ 85%) przez dwie minuty, dyspozytor dostaje
+  rekomendację dodatkowego kursu i wysyła go jednym kliknięciem. Decyzja zawsze należy
+  do człowieka.
+- **Chroni prywatność.** Model działa na urządzeniu w wagonie. Do serwera trafiają tylko
+  liczby, nigdy obraz.
+
+![Mapa na żywo: przepełniony tramwaj linii 13 z kartą 92% zapełnienia](docs/media/map.jpg)
+
+## Jak to działa
+
+```mermaid
+flowchart LR
+    cam["Kamera<br/>w tramwaju"] --> counter["counter/<br/>RT-DETR + tracker"]
+    counter -- "zdarzenia +1/−1<br/>lub liczba osób" --> ingest["backend/<br/>/ingest"]
+    ztp["GTFS-Realtime<br/>ZTP Kraków"] -- "pozycje co 5 s" --> store["Stan pojazdów"]
+    ingest --> store
+    store --> engine["Silnik decyzyjny<br/>≥ 85% przez 2 min"]
+    engine -- "rekomendacja" --> ui["frontend/<br/>mapa dyspozytora"]
+    store -- "WebSocket" --> ui
+    ui -- "Wyślij rezerwę" --> dispatch["Symulacja<br/>dodatkowego kursu"]
 ```
-Aplikacja będzie dostępna pod adresem: `http://localhost:5173`
 
-### Uruchomienie ręczne
+| Kamera nad drzwiami | Kamera w wagonie |
+|---|---|
+| ![Kamera monitoringu nad drzwiami autobusu z ramkami modelu](docs/media/door-camera.jpg) | ![Kamera pod sufitem autobusu: osoba na wózku i wózek inwalidzki](docs/media/cabin-camera.jpg) |
+| Liczy przejścia przez próg; backend sumuje bilans. | Podaje bezwzględną liczbę osób i wózków; koryguje bilans. |
 
-**Backend:**
+## Szybki start
+
+Wymagania: Python 3.12+, [uv](https://github.com/astral-sh/uv), Node.js 22+.
+
 ```bash
+# 1. Backend na prawdziwym feedzie ZTP (http://localhost:8000)
 cd backend
-uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
+uv sync --extra dev
+REALTIME_ENABLED=true SEED_FIXTURES=false uv run uvicorn app.main:app --reload --port 8000
 
-**Frontend:**
-```bash
+# 2. Frontend (http://localhost:5173)
 cd frontend
 npm install
 npm run dev
 ```
 
-## Liczniki pasażerów (`/counter`)
+- `http://localhost:5173` to strona projektu.
+- `http://localhost:5173/mapa` to mapa dyspozytora.
+- `http://localhost:8000/docs` to dokumentacja API (Swagger).
 
-Kamera nad drzwiami wykrywa ludzi (RT-DETR z Hugging Face, licencja Apache-2.0), śledzi ich
-między klatkami i liczy przejścia przez linię w progu. Wynik leci do backendu jako
-**delty** — ktoś wsiadł, ktoś wysiadł — a backend sumuje je w zajętość pojazdu. To pierwsza
-realna implementacja `OccupancyProvider`, który wcześniej był tylko interfejsem.
+Backend na innym porcie? Uruchom frontend z `VITE_API_BASE_URL=http://localhost:<port>/api/v1`.
 
-Dlaczego RT-DETR, a nie YOLO: Ultralytics YOLO jest na licencji **AGPL-3.0**, co w produkcie
-oznacza otwarcie kodu albo płatną licencję.
+Bez dostępu do internetu: `SEED_FIXTURES=true REALTIME_ENABLED=false` podnosi backend
+z kilkoma przykładowymi pojazdami zamiast feedu ZTP.
 
-### Jak to przetestować
+**Docker:** `docker compose up --build` uruchamia oba serwisy na tych samych portach.
+Zmienne środowiskowe są opisane w [`.env.example`](.env.example).
+
+## Demo w pięć minut
+
+1. Otwórz `http://localhost:5173/mapa` (w dzień na mapie jest około 130 tramwajów).
+2. Kliknij **Symuluj tłok**. Backend wybiera tramwaj najbliżej centrum i ustawia go na 186
+   z 202 osób, z przykładowym wózkiem inwalidzkim i dziecięcym. Mapa śledzi ten tramwaj.
+3. Po około dwóch minutach pojawia się karta **„Linia … jest przepełniona”**: pulsuje,
+   gra krótki dźwięk i pokazuje licznik w tytule karty przeglądarki.
+4. Kliknij **Wyślij rezerwę**. Na mapie rusza dodatkowy tramwaj trasą tej linii.
+
+Symulowany tłok przechodzi tą samą drogą co dane z prawdziwej kamery, więc kolor na mapie,
+historia i rekomendacja są prawdziwe; zmyślona jest tylko liczba pasażerów. Po 10 minutach
+symulacja sama się kończy.
+
+## Licznik pasażerów
+
+Katalog [`counter/`](counter/) to program działający przy kamerze. Wykrywa ludzi modelem
+RT-DETR (Apache-2.0), śledzi ich między klatkami i liczy przejścia przez linię w progu.
+Szczegóły uruchomienia, w tym z kamery laptopa: [`counter/README.md`](counter/README.md).
 
 ```bash
-# 1. Backend z pojazdem demo (linia 16, id 2184)
-cd backend
-SEED_FIXTURES=true REALTIME_ENABLED=false uv run uvicorn app.main:app --port 8000
-
-# 2. Klucz dla licznika — wypisany raz, w pliku zostaje tylko hash.
-#    Działający backend łapie nowe urządzenie bez restartu.
-uv run python -m scripts.provision_device --vehicle-id 2184
-
-# 3. Licznik (pierwszy raz: uv sync --extra ml)
-cd ../counter
+cd backend && uv run python -m scripts.provision_device --vehicle-id ztp-tram:326   # klucz urządzenia
+cd counter && uv sync --extra ml
 uv run count-doorway --source 0 --preview --torch-device mps --device-key tbn_...
 ```
 
-`--source 0` / `1` to kamery (na Macu iPhone przez Continuity Camera i wbudowana),
-`--source plik.mp4` to nagranie. `--preview` pokazuje ramki i linię, `--no-post` uruchamia
-sam model bez wysyłania czegokolwiek. Na Macu zawsze `--torch-device mps` — 15 fps zamiast 4.
+Skrypty pomocnicze w `backend/scripts/`:
 
-Dashboard (`frontend`) nie wymaga zmian: dostaje `vehicle.updated` po WebSockecie i pokazuje
-zapełnienie tak jak dla danych z demo.
+| Skrypt | Do czego |
+|---|---|
+| `provision_device` | Wydaje klucz urządzenia dla pojazdu; w pliku zostaje tylko hash. |
+| `demo_overload` | Trzyma wybrany tramwaj pełnym przez API licznika (`--no-dispatch` na pokaz). |
+| `cabin_feed` | Odtwarza zapis z kamery w wagonie jako kolejne odczyty dla tramwaju. |
 
-Z prawdziwym feedem GTFS (`REALTIME_ENABLED=true`) id pojazdów mają postać
-`ztp-tram:<numer>` — klucz wydaje się dla takiego id.
+## API
 
-### Co się dzieje w backendzie
+Wszystkie ścieżki pod prefiksem `/api/v1`. Pełny opis: `http://localhost:8000/docs`.
 
-- `POST /api/v1/ingest/passages` — partia zdarzeń z licznika, idempotentna po `eventId`:
-  ponownie wysłana partia nie zmienia liczby.
-- `POST /api/v1/ingest/anchor` — bezwzględna liczba pasażerów; na pętli prawda to zero,
-  niezależnie od tego, ile naliczyły delty.
-- Zajętość jest **nakładana** na pojazdy z GTFS przy każdym odświeżeniu. Feed nie niesie
-  zapełnienia, więc bez tego każdy odczyt znikałby po 5 sekundach.
-- Po każdym pomiarze uruchamia się silnik decyzyjny — wcześniej działał tylko dla
-  scenariuszy demo. Najwyżej jedna otwarta rekomendacja na linię i kierunek.
-- Odczyt starszy niż 180 s (`OCCUPANCY_STALE_SECONDS`) nie jest pokazywany jako aktualny.
+| Metoda i ścieżka | Opis |
+|---|---|
+| `GET /vehicles` | Pojazdy z pozycją, opóźnieniem i zapełnieniem |
+| `GET /vehicles/{id}` · `/history` | Szczegóły i historia pojazdu |
+| `GET /routes` · `/{id}/shape` | Linie i geometria trasy |
+| `POST /ingest/passages` | Partia zdarzeń z licznika (klucz urządzenia, idempotentna po `eventId`) |
+| `POST /ingest/anchor` | Bezwzględna liczba osób, opcjonalnie z wózkami i rowerami |
+| `GET /recommendations` · `POST /{id}/dismiss` | Rekomendacje dodatkowego kursu |
+| `POST /mock-dispatch/extra-trams` | Wysłanie rezerwy (symulacja) |
+| `POST /demo/overload` | Symulowany tłok na prawdziwym tramwaju |
+| `WS /live` | Aktualizacje pojazdów i rekomendacji na żywo |
 
-### Znane ograniczenia (PoC)
+## Struktura repozytorium
 
-- **Stan w pamięci.** Restart backendu zeruje liczniki i zapomina widziane `eventId`.
-- **Headway i dostępność rezerwy są stałymi** (`LIVE_ASSUMED_*` w `state_store.py`) — to
-  miejsce na lepsze heurystyki wysyłania tramwajów.
-- **`OCCUPANCY_CONFIDENCE=0.9` jest zadeklarowane, nie zmierzone.** Licznik nie podaje
-  pewności; trzeba ją wyznaczyć porównując z ręcznym liczeniem.
-- **Model widział tylko wagi z COCO.** Detekcja z góry działa przy testach przy biurku, ale
-  skuteczność na prawdziwych drzwiach tramwaju nie jest zmierzona.
-- Kilka drzwi: osobny licznik i klucz na każde drzwi, wszystkie z tym samym
-  `--vehicle-id`. Piszą do wspólnej sumy pojazdu; `eventId` zawiera nazwę drzwi
-  (`--door front|middle|rear`), więc zdarzenia z różnych drzwi się nie zderzają.
+```
+backend/     FastAPI: feed GTFS-Realtime, przyjmowanie danych z liczników, silnik decyzyjny
+counter/     Licznik pasażerów: RT-DETR, tracker, wysyłka zdarzeń do backendu
+frontend/    Next.js (vinext) + MapLibre: strona projektu (/) i mapa dyspozytora (/mapa)
+docs/        Plan wdrożenia, propozycja silnika decyzyjnego v2, logo, zrzuty ekranu
+```
 
-## Identyfikacja wizualna
-Materiały graficzne i logotypy projektu znajdują się w folderze `/Identification `.
+## Testy
+
+```bash
+cd backend && uv run --extra dev pytest      # API, przyjmowanie danych, rekomendacje
+cd counter && uv run pytest                  # geometria linii, tracker, wysyłka zdarzeń
+cd frontend && npx tsc --noEmit && npm run lint
+```
+
+Te same kroki uruchamia GitHub Actions przy każdym pushu.
+
+## Stan prototypu
+
+To działający prototyp na hackathon, nie system produkcyjny.
+
+- **Stan jest w pamięci.** Restart backendu zeruje liczniki i rekomendacje.
+- **Model jest ogólny, bez douczania.** Na nagraniach z kamer nad drzwiami i pod sufitem
+  autobusu wykrywa ludzi dobrze. Pełnego wagonu w godzinach szczytu z kamery w krakowskim
+  tramwaju jeszcze nie sprawdziliśmy.
+- **Kilka kamer w jednym wagonie liczy niezależnie.** Bez podziału na strefy ta sama osoba
+  widziana z dwóch kamer liczy się dwa razy.
+- **Wózki wykrywa wolny model OWLv2** (około 1 s na klatkę). Docelowo ten sam szybki
+  detektor po douczeniu.
+- **Odstęp do następnego kursu i dostępność rezerw to stałe** (`LIVE_ASSUMED_*`
+  w `backend/app/services/state_store.py`), a wagi miejsca wózków i rowerów to założenia.
+- **Pewność pomiaru (`OCCUPANCY_CONFIDENCE`) jest zadeklarowana,** nie zmierzona.
+
+Następne kroki: nagrania z monitoringu krakowskich tramwajów do sprawdzenia i douczenia
+modelu, strefy dla kamer w wagonie, prawdziwe dane o rezerwach i prognoza tłoku.
+
+## Materiały i podziękowania
+
+- Pozycje pojazdów: [GTFS-Realtime ZTP Kraków](https://gtfs.ztp.krakow.pl).
+- Mapa: © [OpenStreetMap](https://www.openstreetmap.org/copyright).
+- Detektor: [RT-DETR](https://huggingface.co/PekingU/rtdetr_r18vd_coco_o365) (Apache-2.0);
+  wózki: [OWLv2](https://huggingface.co/google/owlv2-base-patch16-ensemble) (Apache-2.0).
+- Nagrania i zdjęcia na stronie (ramki dodane przez nasz model):
+  - przystanek we Wrocławiu: SHOX ART, [Pexels](https://www.pexels.com/video/city-tram-stop-with-passengers-boarding-29414701/);
+  - kamery w autobusie: TU Berlin / MAN Truck & Bus, [Multi-View In-Cabin Dataset](https://github.com/EvgenyGorelik/multiview_incabin_dataset), CC BY 4.0;
+  - kamera nad drzwiami: topviewhuman, [Roboflow Universe](https://universe.roboflow.com/topviewhuman/_bus_passenger_camera_middle_door), CC BY 4.0;
+  - wózki w autobusie: Metropolitan Transportation Authority, Wikimedia Commons, CC BY 2.0;
+  - rower w wagonie: citytransportinfo, Wikimedia Commons, CC0.
+- Bazowa wersja mapy, integracji GTFS i silnika decyzyjnego:
+  [komar](https://github.com/0xKomar) ([0xKomar/TBN](https://github.com/0xKomar/TBN)).

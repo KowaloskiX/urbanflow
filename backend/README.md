@@ -25,10 +25,10 @@ kontraktów HTTP oraz WebSocket potrzebnych frontendowi.
 - CORS konfigurowany adresem frontendu,
 - testy głównego przepływu demonstracyjnego.
 
-Na tym etapie pozycje i trasy są danymi demonstracyjnymi. Interfejsy pod
-GTFS-Realtime i Occupancy API są przygotowane, ale prawdziwe źródła nie są
-jeszcze podłączone. Stan znika po restarcie procesu, ponieważ SQLite będzie
-dodany w kolejnym etapie.
+Pozycje pojazdów pochodzą z feedu GTFS-Realtime ZTP Kraków (`REALTIME_ENABLED=true`), a
+zapełnienie z liczników pasażerów przez endpointy `/ingest` (opis w głównym
+[README](../README.md#licznik-pasażerów)). Stan jest przechowywany w pamięci i znika po
+restarcie procesu.
 
 ## Technologie
 
