@@ -174,9 +174,6 @@ To działający prototyp na hackathon, nie system produkcyjny.
   w `backend/app/services/state_store.py`), a wagi miejsca wózków i rowerów to założenia.
 - **Pewność pomiaru (`OCCUPANCY_CONFIDENCE`) jest zadeklarowana,** nie zmierzona.
 
-Następne kroki: nagrania z monitoringu krakowskich tramwajów do sprawdzenia i douczenia
-modelu, strefy dla kamer w wagonie, prawdziwe dane o rezerwach i prognoza tłoku.
-
 ## Materiały i podziękowania
 
 - Pozycje pojazdów: [GTFS-Realtime ZTP Kraków](https://gtfs.ztp.krakow.pl).
@@ -189,5 +186,3 @@ modelu, strefy dla kamer w wagonie, prawdziwe dane o rezerwach i prognoza tłoku
   - kamera nad drzwiami: topviewhuman, [Roboflow Universe](https://universe.roboflow.com/topviewhuman/_bus_passenger_camera_middle_door), CC BY 4.0;
   - wózki w autobusie: Metropolitan Transportation Authority, Wikimedia Commons, CC BY 2.0;
   - rower w wagonie: citytransportinfo, Wikimedia Commons, CC0.
-- Bazowa wersja mapy, integracji GTFS i silnika decyzyjnego:
-  [komar](https://github.com/0xKomar) ([0xKomar/TBN](https://github.com/0xKomar/TBN)).
