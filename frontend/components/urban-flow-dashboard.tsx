@@ -43,6 +43,7 @@ import { Button } from '@/components/ui/button';
 import { BrandWordmark } from '@/components/brand-wordmark';
 import { AnimatedNumber, cardMotion, spring } from '@/components/motion-primitives';
 import { TramFill } from '@/components/tram-fill';
+import { loadMapLibre } from '@/lib/maplibre';
 import { API_BASE, WS_URL } from '@/lib/api';
 
 type Freshness = 'LIVE' | 'STALE' | 'OFFLINE' | 'SIMULATION';
@@ -714,7 +715,7 @@ export function UrbanFlowDashboard() {
     if (!mapContainer.current || mapRef.current) return;
     let disposed = false;
 
-    void import('maplibre-gl').then((maplibregl) => {
+    void loadMapLibre().then((maplibregl) => {
       if (disposed || !mapContainer.current) return;
       const map = new maplibregl.Map({
         container: mapContainer.current,

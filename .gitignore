@@ -13,3 +13,6 @@ devices.local.json
 dist/
 .wrangler/
 frontend/.next/
+
+# Copied from node_modules at build time
+frontend/public/maplibre/

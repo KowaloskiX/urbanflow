@@ -6,7 +6,9 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "predev": "node scripts/copy-maplibre-worker.mjs",
     "dev": "vinext dev",
+    "prebuild": "node scripts/copy-maplibre-worker.mjs",
     "build": "vinext build",
     "start": "wrangler dev --config dist/server/wrangler.json",
     "lint": "oxlint app lib components/urban-flow-dashboard.tsx components/ui/button.tsx components/ui/badge.tsx components/pitch components/brand-wordmark.tsx components/motion-primitives.tsx components/tram-fill.tsx",

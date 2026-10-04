@@ -3,6 +3,7 @@
 import { useEffect, useRef } from 'react';
 import type { GeoJSONSource, Map as MapLibreMap } from 'maplibre-gl';
 
+import { loadMapLibre } from '@/lib/maplibre';
 import { API_BASE } from '@/lib/api';
 
 type LiveVehicle = {
@@ -90,7 +91,7 @@ export function LiveCityMap({ onCount }: { onCount?: (trams: number) => void }) 
       }
     };
 
-    void import('maplibre-gl').then((maplibregl) => {
+    void loadMapLibre().then((maplibregl) => {
       if (disposed || !container.current) return;
       map = new maplibregl.Map({
         container: container.current,
