@@ -9,6 +9,10 @@
 Kamera liczy pasażerów, mapa pokazuje zapełnienie krakowskich tramwajów na żywo,
 a dyspozytor dostaje gotową propozycję dodatkowego kursu.
 
+**[Strona](https://frontend-production-2965.up.railway.app)** ·
+**[Mapa na żywo](https://frontend-production-2965.up.railway.app/mapa)** ·
+**[API](https://backend-production-9086.up.railway.app/docs)**
+
 </div>
 
 ![Strona UrbanFlow: przystanek z góry, model zaznacza wsiadających i wysiadających](docs/media/landing.jpg)
@@ -23,6 +27,7 @@ a dyspozytor dostaje gotową propozycję dodatkowego kursu.
 - [API](#api)
 - [Struktura repozytorium](#struktura-repozytorium)
 - [Testy](#testy)
+- [Wdrożenie](#wdrożenie)
 - [Stan prototypu](#stan-prototypu)
 - [Materiały i podziękowania](#materiały-i-podziękowania)
 
@@ -157,6 +162,24 @@ cd frontend && npx tsc --noEmit && npm run lint
 ```
 
 Te same kroki uruchamia GitHub Actions przy każdym pushu.
+
+## Wdrożenie
+
+Wersja na żywo działa na [Railway](https://railway.com) jako dwa serwisy budowane z
+Dockerfile w `backend/` i `frontend/`.
+
+| Serwis | Zmienne |
+|---|---|
+| `backend` | `REALTIME_ENABLED=true`, `SEED_FIXTURES=false`, `FRONTEND_ORIGIN=<adres frontendu>` (CORS) |
+| `frontend` | `VITE_API_BASE_URL=<adres backendu>/api/v1` — wpisywany do bundla przy budowaniu |
+
+```bash
+railway up backend --path-as-root --service backend
+railway up frontend --path-as-root --service frontend
+```
+
+Stan backendu jest w pamięci, więc każde wdrożenie albo restart zaczyna od pustej mapy
+zapełnień; pozycje pojazdów wracają z feedu ZTP po kilku sekundach.
 
 ## Stan prototypu
 
