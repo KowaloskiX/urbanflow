@@ -9,7 +9,7 @@
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "wrangler dev --config dist/server/wrangler.json",
-    "lint": "oxlint app components/urban-flow-dashboard.tsx components/ui/button.tsx components/ui/badge.tsx lib",
+    "lint": "oxlint app lib components/urban-flow-dashboard.tsx components/ui/button.tsx components/ui/badge.tsx components/pitch components/brand-wordmark.tsx components/motion-primitives.tsx components/tram-fill.tsx",
     "format": "oxfmt"
   },
   "dependencies": {
